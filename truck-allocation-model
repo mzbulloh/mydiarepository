@@ -1,0 +1,182 @@
+from flask import Flask, request
+from google.cloud import bigquery, storage
+import pandas as pd
+import re
+import numpy as np
+import datetime
+from datetime import datetime, timedelta, date
+import joblib
+import json
+import geopy.distance
+from sklearn.linear_model import LogisticRegression
+import pulp as pl
+from pulp import LpMaximize, LpMinimize, LpProblem, LpStatus, lpSum, LpVariable, LpInteger
+
+def read_data_from_bq():
+    project_id='project_id'
+    bqclient = bigquery.Client(project=project_id)
+    # Data Inquiry from BQ
+    TS = datetime.now()
+    START_DATE = (TS - timedelta(days=7)).strftime(format="%Y-%m-%d") #Past 7 days
+    END_DATE = (TS - timedelta(days=1)).strftime(format="%Y-%m-%d")
+    TS = TS.strftime(format="%Y%m%d")
+    # BQ parameters from L4 temporary
+    table = 'L4_external_project.source_table'
+    query = f"""
+            SELECT
+                created_at,
+                truck_id,
+                order_cat #data not available
+            FROM project_id.{table} 
+    """
+    delivery_data = bqclient.query(query).result().to_dataframe(create_bqstorage_client=True)
+    return delivery_data
+
+def read_data_from_gcs():
+    storage_client = storage.Client("project_id")
+    bucket = storage_client.bucket("project_id-vertex")
+    data_blob = bucket.blob(f"truck-allocation/delivery_data.pkl")
+    data_blob.download_to_filename(f"/tmp/delivery_data.pkl")
+    delivery_data = joblib.load(f"/tmp/delivery_data.pkl")
+    return delivery_data
+
+def order_type_prediction(trip_price,km_trip):
+    storage_client = storage.Client("project_id")
+    bucket = storage_client.bucket("project_id-vertex")
+    model_blob = bucket.blob(f"truck-allocation/classification_order.pkl")
+    model_blob.download_to_filename(f"/tmp/classification_order.pkl")
+    model = joblib.load(f"/tmp/classification_order.pkl")
+    data_request = pd.DataFrame({'Minimum Price': [trip_price], 'KM Trip': [km_trip]})
+    order_type = list(model.predict(data_request))[0]
+    return order_type
+
+def vehicle_filtering(vehicle_list,km_trip,min_km_trip,min_vehicle_age):
+    # vehicle_list = pd.read_json(json.dumps(vehicle_list))
+    vehicle_list = pd.json_normalize(vehicle_list, meta=['truck_id', 'manufacture_year'])
+    # truck=[]
+    # manufacture_year=[]
+    # for i in range(len(vehicle_list)):
+    #     truck.append(vehicle_list[i]['truck_id'])
+    #     manufacture_year.append(vehicle_list[i]['manufacture_year'])
+    # vehicle_list=pd.DataFrame({'truck_id':truck,'manufacture_year':manufacture_year})
+    # vehicle_list = vehicle_list[vehicle_list['vehicle_type'] == vehicle_type]
+    vehicle_list['manufacture_year'] = vehicle_list['manufacture_year'].astype('int')
+    vehicle_list['current_year'] = date.today().year
+    vehicle_list['age'] =  vehicle_list['current_year'] - vehicle_list['manufacture_year']    
+    vehicle_list['km_trip'] = km_trip
+    vehicle_list.loc[vehicle_list['km_trip']<=min_km_trip,'flag'] = 2
+    vehicle_list.loc[(vehicle_list['km_trip']>min_km_trip) & (vehicle_list['age']<=min_vehicle_age),'flag'] = 1
+    vehicle_list.loc[(vehicle_list['km_trip']>min_km_trip) & (vehicle_list['age']>min_vehicle_age),'flag'] = 0
+    vehicle = list(vehicle_list[vehicle_list['flag']>0]['truck_id'])
+    return vehicle
+      
+def retrieve_vehicle_list(vehicle):
+    # delivery_data = read_data_from_bq(query=query)
+    delivery_data = read_data_from_gcs()
+    delivery_data = delivery_data[delivery_data['truck_id'].isin(vehicle)]
+    vehicle_list_historical = delivery_data['truck_id'].unique()
+    vehicle_no_hist = list(set(vehicle)^set(vehicle_list_historical))
+    # vehicle_no_hist = list(set(vehicle_list_historical)^set(vehicle))
+    return delivery_data,vehicle_no_hist
+
+def calculate_vehicle_points(delivery_data,score_good,score_bad):
+    delivery_data=pd.crosstab(delivery_data['truck_id'],delivery_data['order_cat']).reset_index()
+    delivery_data['order_value_BAD'] = delivery_data['BAD']*score_bad
+    delivery_data['order_value_GOOD'] = delivery_data['GOOD']*score_good
+    delivery_data['total_order_value'] = delivery_data['order_value_BAD']+delivery_data['order_value_GOOD']
+    delivery_data['count_order_value'] = delivery_data['BAD']+delivery_data['GOOD']
+    return delivery_data
+
+def optimize_truck_allocation(delivery_data,score_good,score_bad,order_type):
+    n = len(delivery_data)
+    dv = [LpVariable(f"x{a+1}", lowBound=0, upBound=1, cat='Integer') for a in range(n)]
+    X = np.matrix(dv).reshape(n,1)
+    V = np.matrix(delivery_data['total_order_value']).reshape(1,n)
+    if order_type == 'GOOD': O = score_good
+    else: O = score_bad
+    y_output = V @ X * O
+    y_re = np.str_(y_output)
+    y_re = y_re.replace(" + 0]]", "")
+    y_re = y_re.replace("[[", "")
+    regular_expression = r'[*+/ t]'
+    split_string = re.split(regular_expression, y_re)
+    y_string = split_string[0::4]
+    x_string = split_string[1::4]
+    y_value = []
+    for i in y_string: y_value.append(float(i))
+    dictionary_objective_func = {x_string: y_value for x_string, y_value in zip (x_string, y_value)}
+    dictionary_variable = {x_string:dv for x_string, dv in zip (x_string, dv)}
+    model = LpProblem("TruckAllocation", sense= LpMinimize)
+    model +=lpSum([dictionary_objective_func[var] * dictionary_variable[var] for var in x_string])
+    model += sum(dv[k] for k in range(n)) == 1
+    status = model.solve()
+    for v in filter(lambda v: v.varValue == 1.0, model.variables()):
+        assignment_truk = f"{v.name}"
+        assignment_truk = int(assignment_truk[1:])-1 
+    return assignment_truk
+
+app = Flask(__name__)
+ 
+@app.route("/health", methods=["GET"])
+def health():
+    return {"message": "OK"}, 200
+ 
+@app.route("/delivery_request", methods=["POST"])
+def delivery_request():
+    #### Get Data from API ####
+    input_json = request.get_json()
+    instance: dict = input_json["instances"][0]
+    ## Data Input from Endpoint
+    vehicle_list = instance["vehicle_list"]
+    # delivery_data = instance["delivery_data"]
+    ## Order Spec
+    # vehicle_type = instance["vehicle_type"]
+    # km_trip = float(instance["km_trip"])
+    lat_origin = float(instance["lat_origin"])
+    lon_origin = float(instance["lon_origin"])
+    lat_destination = float(instance["lat_destination"])
+    lon_destination = float(instance["lon_destination"])
+    trip_price = float(instance["trip_price"])
+    load_weight = float(instance["load_weight"])
+    ## Requirement
+    min_km_trip = float(instance["min_km_trip"])
+    min_vehicle_age = int(instance["min_vehicle_age"])
+    score_good = 3
+    score_bad = 1
+    
+    #### Preprocessing ####
+    # Calculate price_per_kg
+    price_per_kg = trip_price/load_weight
+    
+    # Calculate trip distance (km_trip)
+    coord_origin = (lat_origin,lon_origin)
+    coord_destination = (lat_destination,lon_destination)
+    km_trip = geopy.distance.geodesic(coord_origin, coord_destination).km
+
+    #### Main Process ####
+    # 1.Predict order_type using model from cloud storage #
+    order_type = order_type_prediction(trip_price=trip_price,km_trip=km_trip)
+ 
+    # 2.Get Vehicle Data based on Requirement #
+    vehicle = vehicle_filtering(vehicle_list=vehicle_list,km_trip=km_trip,min_km_trip=min_km_trip,min_vehicle_age=min_vehicle_age)
+    
+    if len(vehicle) >= 1 :
+        # 3.Import Delivery Data History from BQ (Past 7 Days) and Check Vehicle with no Data History #
+        delivery_data,vehicle_no_hist = retrieve_vehicle_list(vehicle=vehicle)
+        if len(vehicle_no_hist)==0:
+            # 4.Calculate Vehicle Total Points #
+            delivery_data = calculate_vehicle_points(delivery_data=delivery_data,score_good=score_good,score_bad=score_bad)
+            # 5.Optimize Truck Allocation #
+            assignment_truk = optimize_truck_allocation(delivery_data=delivery_data,score_good=score_good,score_bad=score_bad,order_type=order_type)
+            result = delivery_data['truck_id'].iloc[assignment_truk]
+        else:
+            result = vehicle_no_hist[0]
+    else:
+        result = 'No Truck Available'
+
+    return {
+        "prediction": [result,order_type]
+    }, 200
+ 
+if __name__ == "__main__":
+    app.run(host="0.0.0.0",port=8080)
