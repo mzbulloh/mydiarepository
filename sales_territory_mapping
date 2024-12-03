@@ -159,7 +159,7 @@
         "from google.cloud import bigquery\n",
         "from google.colab import data_table\n",
         "\n",
-        "project = 'logee-data-prod' # Project ID inserted based on the query results selected to explore\n",
+        "project = 'source_table' # Project ID inserted based on the query results selected to explore\n",
         "location = 'asia-southeast2' # Location inserted based on the query results selected to explore\n",
         "client = bigquery.Client(project=project, location=location)\n",
         "data_table.enable_dataframe_formatter()\n",
@@ -222,9 +222,9 @@
       "cell_type": "code",
       "source": [
         "query_sql='''select a.*,b.*,c.upgrade from\n",
-        "(SELECT distinct store_id FROM `logee-data-prod.L4_visibility.lgd_orders` where latest=1 and safe_cast(REGEXP_REPLACE(safe_cast(DATE(modified_at_wib) as string), r'[-,]', '') as int64 ) >= 20221001 and safe_cast(REGEXP_REPLACE(safe_cast(DATE(created_at_wib) as string), r'[-,]', '') as int64 ) >= 20221001 and company_id in ('3b70f681-e47f-4ea6-9fc4-11d601e1c43c','c3ea5189-59f2-41ad-bd8c-e47ac2e945e3','16d45b48-9716-4dc1-939a-1a398e83e5bd','cb48489a-3db3-4548-b212-30667ef14d31','e577faee-2478-4064-841d-33ab752b3346','d253a6d6-e5fa-4f69-877a-1ae50b2b0fb2','c887dc90-cd1a-4578-b5b5-f051926e31f2','083f9d1d-bd07-4f1a-a681-714fd6017a5c','347de3a4-a3e8-4c5a-83c0-4f86c44e2b0e','e7efc550-a127-4593-876c-8f01e94acccb','554a23a6-5257-4c61-a5d1-0f7484c06038','c7120e31-c631-4d56-937e-313bebc2a8db','4bea3ab0-4fee-4228-9c06-582a4907e9de','203cca58-21ea-4555-a60a-8c495e862600','f818e99a-5f17-463b-84be-a0312b4fae6a') and store_id not in ('7560843c-d8d3-4ad7-b458-93faab6edb64','f8ca4b14-bcaf-4c6e-aad4-884205f273bf','dbbb3a12-7f8e-40e7-adae-e63e6af6084f','3c566e96-f0d7-49f4-95ca-ad49a0980af6','faba02d4-6333-499e-bb9a-5002bdf32fd9')) a left join\n",
-        "(SELECT store_id,company_id,main_address.address,main_address.district,main_address.lat,main_address.long FROM `logee-data-prod.L4_visibility.lgd_store` where latest=1) b on a.store_id=b.store_id left join\n",
-        "(select store_id,upgrade from `logee-data-prod.L4_ml_product.new_sales_target_q123`) c on a.store_id=c.store_id'''"
+        "(SELECT distinct store_id FROM `source_table.orders` where latest=1 and safe_cast(REGEXP_REPLACE(safe_cast(DATE(modified_at_wib) as string), r'[-,]', '') as int64 ) >= 20221001 and safe_cast(REGEXP_REPLACE(safe_cast(DATE(created_at_wib) as string), r'[-,]', '') as int64 ) >= 20221001 and company_id in ('3b70f681-e47f-4ea6-9fc4-11d601e1c43c','c3ea5189-59f2-41ad-bd8c-e47ac2e945e3','16d45b48-9716-4dc1-939a-1a398e83e5bd','cb48489a-3db3-4548-b212-30667ef14d31','e577faee-2478-4064-841d-33ab752b3346','d253a6d6-e5fa-4f69-877a-1ae50b2b0fb2','c887dc90-cd1a-4578-b5b5-f051926e31f2','083f9d1d-bd07-4f1a-a681-714fd6017a5c','347de3a4-a3e8-4c5a-83c0-4f86c44e2b0e','e7efc550-a127-4593-876c-8f01e94acccb','554a23a6-5257-4c61-a5d1-0f7484c06038','c7120e31-c631-4d56-937e-313bebc2a8db','4bea3ab0-4fee-4228-9c06-582a4907e9de','203cca58-21ea-4555-a60a-8c495e862600','f818e99a-5f17-463b-84be-a0312b4fae6a') and store_id not in ('7560843c-d8d3-4ad7-b458-93faab6edb64','f8ca4b14-bcaf-4c6e-aad4-884205f273bf','dbbb3a12-7f8e-40e7-adae-e63e6af6084f','3c566e96-f0d7-49f4-95ca-ad49a0980af6','faba02d4-6333-499e-bb9a-5002bdf32fd9')) a left join\n",
+        "(SELECT store_id,company_id,main_address.address,main_address.district,main_address.lat,main_address.long FROM `source_table.store` where latest=1) b on a.store_id=b.store_id left join\n",
+        "(select store_id,upgrade from `source_table.model_table.new_sales_target_q123`) c on a.store_id=c.store_id'''"
       ],
       "metadata": {
         "id": "zRmuTk473wV4"
@@ -1783,7 +1783,7 @@
     {
       "cell_type": "code",
       "source": [
-        "pandas_gbq.to_gbq(data_mapping,destination_table = 'L4_ml_product.sales_territory', project_id='logee-data-prod',if_exists='append')"
+        "pandas_gbq.to_gbq(data_mapping,destination_table = 'model_table.sales_territory', project_id='source_table',if_exists='append')"
       ],
       "metadata": {
         "colab": {
