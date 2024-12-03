@@ -1,0 +1,312 @@
+from google.cloud import aiplatform as aip
+import kfp
+from kfp import dsl
+from kfp.v2 import compiler
+from kfp.v2.dsl import component
+from datetime import datetime, timedelta
+import sys  In [2]:  PYTHON_BASE_IMAGE = "python:3.9"
+
+# GCP parameters
+PROJECT_ID = "project_id"
+REGION = "asia-southeast2"
+SERVICE_ACCOUNT = "service_account@mail.com"
+
+# GCS parameters
+GCS_BUCKET = "bucket"
+GCS_PIPELINE_ROOT_DIRECTORY = "pipeline/store-grading"
+
+# Vertex parameters
+PIPELINE_DISPLAY_NAME = f"store-grading-pipeline"
+#PIPELINE_JSON = f"compiled.{PIPELINE_DISPLAY_NAME}.json"  In [6]:  @component(
+    packages_to_install=["pandas==1.5.3","numpy==1.24.2","pandas-gbq==0.19.1","datetime","statistics","scikit-learn==1.3.0","scipy==1.10.1","google-cloud-bigquery==3.6.0","google-cloud-storage==2.7.0"],
+    base_image=PYTHON_BASE_IMAGE,
+)
+def process(
+):
+    import pandas as pd
+    import numpy as np
+    import pandas_gbq
+    import datetime
+    from datetime import datetime
+    from datetime import timedelta
+    import statistics
+    import sklearn
+    from sklearn.datasets import make_blobs
+    from sklearn import cluster
+    from scipy.signal import periodogram
+    from google.cloud import bigquery
+    from google.cloud import storage
+
+    def trenddetector(list_of_index, array_of_data, order=1):
+        result = np.polyfit(list_of_index, list(array_of_data), order)
+        slope = result[-2]
+        return float(slope)
+
+    today = datetime.now()
+    first = today.replace(day=1)
+    lastmonth = first - timedelta(days=1)
+    last3days = first - timedelta(days=4)
+    last7days = first - timedelta(days=8)
+    prev1month = lastmonth - pd.offsets.MonthEnd(n=1) + timedelta(days=1)
+    prev3month = lastmonth - pd.offsets.MonthEnd(n=3) + timedelta(days=1)
+    prev6month = lastmonth - pd.offsets.MonthEnd(n=6) + timedelta(days=1)
+    
+    project_write_table='table_name'
+    #Retrieve order and detail data from BigQuery
+    bqclient = bigquery.Client(project='project_name')
+    
+    query_order = '''select a.company_id,a.created_at,b.* from (select company_id,store_id,DATE(created_at) as created_at from `source_table.store` where latest=1) a inner join (SELECT store_id,order_summary.total_price,SAFE_CAST(REGEXP_REPLACE(SAFE_CAST(DATE(created_at_wib) AS string), r"-", "") AS int64 ) AS create_dt FROM project_name.source_table.orders base WHERE latest=1 AND DATE(created_at_wib) <= '''+'"'+str(lastmonth.strftime("%Y-%m-%d"))+'"'+ ''' AND order_status="COMPLETED" AND base.company_id IN (SELECT warehouse_id FROM `model_table.wh_list`) AND store_id NOT IN (SELECT store_id FROM `model_table.stg_sheets_store_exclusion`)) b on a.store_id=b.store_id'''
+    order = bqclient.query(query_order).result().to_dataframe(create_bqstorage_client=True)
+    order=order.groupby(['company_id','store_id','created_at','create_dt'])['total_price'].sum().reset_index()
+
+    query_time = '''SELECT SAFE_CAST(REGEXP_REPLACE(SAFE_CAST(DATE(id) AS string), r"-", "") AS int64 ) AS id,month FROM `source_table.dim_time` where id between "2021-01-01" and''' +'"'+ str(lastmonth.strftime("%Y-%m-%d"))+'"'
+    dim_time = bqclient.query(query_time).result().to_dataframe(create_bqstorage_client=True)
+
+    query_visit = '''SELECT distinct user_id,event_name,ga_session_id,event_date FROM `project_name.source_table.fact_visit` WHERE DATE(_PARTITIONTIME) >= ''' +'"'+ str(prev3month.strftime("%Y-%m-%d")) +'"'+ ''' and DATE(_PARTITIONTIME) <= ''' +'"'+str(lastmonth.strftime("%Y-%m-%d"))+'"'+''' and user_id is not null order by 3 asc'''
+    apps_visit = bqclient.query(query_visit).result().to_dataframe(create_bqstorage_client=True)
+
+    query_store = ''' select company_id,store_id,DATE(created_at) as created_at  from `source_table.store` where latest=1 and SAFE_CAST(REGEXP_REPLACE(SAFE_CAST(DATE(created_at) AS string), r"-", "") AS int64 ) <= '''+str(int(lastmonth.strftime('%Y%m%d')))+ ''' and company_id in (SELECT warehouse_id FROM `model_table.wh_list`) AND store_id NOT IN (SELECT store_id FROM `model_table.stg_sheets_store_exclusion`)'''
+    all_store = bqclient.query(query_store).result().to_dataframe(create_bqstorage_client=True)
+
+    season_list=pd.DataFrame(data={
+        'period':['semiannual','quarterly','bimonthly','monthly','biweekly','weekly','semiweekly'],
+        'time':[1,2,4,6,12,26,60]})
+
+    now=str(prev1month.strftime("%Y-%m-%d"))
+
+    order_6 = order[order['create_dt']>=int(prev6month.strftime('%Y%m%d'))]
+    dim_time_6 = dim_time[dim_time['id']>=int(prev6month.strftime('%Y%m%d'))]
+    freq=pd.DataFrame(order_6.groupby('store_id')['total_price'].agg(['count'])).reset_index()
+    order_clean_6 = order_6[order_6['store_id'].isin(list(freq[freq['count']>6]['store_id']))]
+    monthly_seasonal_store = pd.DataFrame(list(freq[(freq['count']>3) & (freq['count']<=6)]['store_id']))
+    monthly_seasonal_store.rename(columns = {0: "store_id"},inplace = True)
+    monthly_seasonal_store['cycle'] = 'monthly'
+    no_seasonal_store = pd.DataFrame(list(freq[freq['count']<=3]['store_id']))
+    no_seasonal_store.rename(columns = {0: "store_id"},inplace = True)
+    no_seasonal_store['cycle'] = 'no cycle'
+    data=order_clean_6
+    data_cycle_6 = pd.DataFrame()
+    list_store = list(data['store_id'].unique())
+    for j in list_store:
+        store = data[data['store_id']==j]
+        store = pd.merge(dim_time_6[['id']],store,how='left',left_on='id',right_on='create_dt')
+        store= store[['store_id','total_price','id']]
+        store['store_id']=j
+        store.loc[store['total_price'].isna(),'total_price'] = 0
+        store['flag'] = 1
+        store_temp = store.copy()
+        store_temp['total_price'] = 0
+        store_temp['flag'] = 2
+        store_all = pd.concat([store,store_temp],axis=0).sort_values(['id','flag'],ascending=True)
+        fs = store_all.shape[0]
+        
+        freqencies, spectrum = periodogram(store.total_price, fs=fs, detrend='linear', window="boxcar",scaling='spectrum')
+        cek = pd.DataFrame(freqencies,spectrum).reset_index()
+        cek.rename(columns = {0: "freqencies","index":"spectrum"},inplace = True)
+#         temp=season_list
+#         temp['ratio']=abs(temp['time']/float(cek[cek['spectrum']==max(cek['spectrum'])]['freqencies']/2)-1)
+#         store_all['cycle']=list(temp[temp['ratio']==min(temp['ratio'])]['period'])[0]
+        if max(cek['spectrum'].astype('float')) > 1:
+            temp=season_list
+            temp['ratio']=abs(temp['time']/float(cek[cek['spectrum'].astype('float')==max(cek['spectrum'].astype('float'))]['freqencies'])-1)
+            store_all['cycle']=list(temp[temp['ratio']==min(temp['ratio'])]['period'])[0]
+        else:
+            store_all['cycle']='no cycle'
+        #data_cycle_6=data_cycle_6.append(store_all[['store_id','cycle']].drop_duplicates(), ignore_index = True)
+        data_cycle_6=pd.concat([data_cycle_6,store_all[['store_id','cycle']].drop_duplicates()], ignore_index = True)
+    #data_cycle_6=data_cycle_6.append(no_seasonal_store, ignore_index = True)
+    data_cycle_6=pd.concat([data_cycle_6,no_seasonal_store], ignore_index = True)
+    #data_cycle_6=data_cycle_6.append(monthly_seasonal_store, ignore_index = True)
+    data_cycle_6=pd.concat([data_cycle_6,monthly_seasonal_store],ignore_index = True)
+    data_cycle_6.loc[data_cycle_6['cycle']=='annual','cycle'] = 'no cycle'
+    data_cycle_6.loc[data_cycle_6['cycle']=='semiannual','cycle'] = 'no cycle'
+    data_cycle_6.loc[data_cycle_6['cycle']=='quarterly','cycle'] = 'no cycle'
+    data_cycle_6.loc[data_cycle_6['cycle']=='bimonthly','cycle'] = 'no cycle'
+    data_cycle_6 = pd.merge(order[['company_id','store_id','created_at']].drop_duplicates(),data_cycle_6,on='store_id',how='inner')
+    data_cycle = data_cycle_6
+
+    data_cycle=data_cycle[['company_id','store_id','created_at','cycle']]
+    data_cycle['date']=now
+    recency=pd.DataFrame(order.groupby('store_id')['create_dt'].agg(['max'])).reset_index()
+    recency['month'] = recency['max'].apply(lambda x: pd.to_datetime(str(x), format='%Y%m%d')).apply(lambda x: x.month).astype('int')
+    recency['year'] = recency['max'].apply(lambda x: pd.to_datetime(str(x), format='%Y%m%d')).apply(lambda x: x.year).astype('int')
+    recency['this_month'] = pd.to_datetime(str(now), format='%Y-%m-%d').month
+    recency['this_year'] = pd.to_datetime(str(now), format='%Y-%m-%d').year
+    recency['month_diff'] = (recency['this_year']-recency['year'])*12 + recency['this_month']-recency['month']
+    data_cycle=pd.merge(data_cycle,recency[['store_id','month_diff']],on='store_id',how='inner')
+    data_cycle.loc[(data_cycle.month_diff>3),'status']='Churned'
+    data_cycle.loc[(data_cycle.month_diff<=3),'status']='Not Churned'
+    non_purchase_store = all_store[~(all_store['store_id'].isin(data_cycle['store_id']))].reset_index(drop=True)
+    non_purchase_store['cycle']='no purchase'
+    non_purchase_store['date']=now
+    recency=non_purchase_store[['store_id','created_at']]
+    recency['month'] = recency['created_at'].apply(lambda x: pd.to_datetime(str(x), format='%Y-%m-%d')).apply(lambda x: x.month).astype('int')
+    recency['year'] = recency['created_at'].apply(lambda x: pd.to_datetime(str(x), format='%Y-%m-%d')).apply(lambda x: x.year).astype('int')
+    recency['this_month'] = pd.to_datetime(str(now), format='%Y-%m-%d').month
+    recency['this_year'] = pd.to_datetime(str(now), format='%Y-%m-%d').year
+    recency['month_diff'] = (recency['this_year']-recency['year'])*12 + (recency['this_month']-recency['month'])
+    non_purchase_store=pd.merge(non_purchase_store,recency[['store_id','month_diff']],on='store_id',how='inner')
+    non_purchase_store.loc[(non_purchase_store.month_diff>0),'status']='Churned'
+    non_purchase_store.loc[(non_purchase_store.month_diff<=0),'status']='Not Churned'
+    all_data = pd.concat([data_cycle,non_purchase_store])
+    all_data['created_at'] = all_data['created_at'].apply(lambda x: pd.to_datetime(str(x), format='%Y-%m-%d')).astype('str')
+    all_data['register_month'] = all_data['created_at'].apply(lambda x: pd.to_datetime(str(x), format='%Y-%m-%d'))
+    all_data['register_month']=all_data.register_month - pd.offsets.MonthEnd(0) - pd.offsets.MonthBegin(1)
+    all_data['register_month']=all_data['register_month'].astype('str')
+    pandas_gbq.to_gbq(all_data,destination_table = 'model_table.store_purchase_period', project_id=project_write_table,if_exists='append')
+
+    order = order[order['create_dt']>=int(prev3month.strftime('%Y%m%d'))].reset_index(drop=True)
+    temp_dim_time=dim_time[dim_time['id']>=int(prev3month.strftime('%Y%m%d'))].reset_index(drop=True)
+    order['create_dt'] = order['create_dt'].apply(lambda x: pd.to_datetime(str(x), format='%Y%m%d')).astype('str')
+    order['trx_month'] = order['create_dt'].apply(lambda x: pd.to_datetime(str(x), format='%Y-%m-%d'))
+    order['trx_month']=order.trx_month - pd.offsets.MonthEnd(0) - pd.offsets.MonthBegin(1)
+    order['trx_month']=order['trx_month'].astype('str')
+    temp_dim_time['id'] = temp_dim_time['id'].apply(lambda x: pd.to_datetime(str(x), format='%Y%m%d')).astype('str')
+    temp_dim_time['month_begin'] = temp_dim_time['id'].apply(lambda x: pd.to_datetime(str(x), format='%Y-%m-%d'))
+    temp_dim_time['month_begin']=temp_dim_time.month_begin - pd.offsets.MonthEnd(0) - pd.offsets.MonthBegin(1)
+    temp_dim_time['month_begin']=temp_dim_time['month_begin'].astype('str')
+    temp_dim_time=pd.DataFrame(temp_dim_time['month_begin']).drop_duplicates().reset_index(drop=True)
+    data_order = pd.DataFrame()
+    list_store = list(order['store_id'].unique())
+    for j in list_store:
+        store = order[order['store_id']==j]
+        store = pd.merge(temp_dim_time,store,how='left',left_on='month_begin',right_on='trx_month')
+        store['store_id']=j
+        store.loc[store['total_price'].isna(),'total_price'] = 0
+        store=store[['store_id','total_price','month_begin']]
+        #data_order=data_order.append(store[['store_id','month_begin','total_price']].drop_duplicates(), ignore_index = True)
+        data_order=pd.concat([data_order,store[['store_id','month_begin','total_price']].drop_duplicates()],ignore_index = True)
+    data_order = data_order.groupby(['store_id','month_begin'])['total_price'].agg(['sum']).reset_index()
+    purchase_size = data_order.groupby(['store_id'])['sum'].agg(['mean','max','min']).reset_index()
+    purchase_size.rename(columns = {'mean':'average_gmv','max':'max_gmv','min':'min_gmv'}, inplace = True)
+    purchase_size = pd.merge(order[['company_id','store_id','created_at']].drop_duplicates(),purchase_size[['store_id','average_gmv','max_gmv','min_gmv']],on='store_id',how='inner')
+    avg_trx = order.groupby('store_id')['total_price'].agg(['mean','count']).reset_index()
+    avg_trx.rename(columns = {'mean':'average_transaction','count':'count_transaction'}, inplace = True)
+    purchase_size=pd.merge(purchase_size,avg_trx,how='inner',on='store_id')
+    purchase_size['date']=now
+    pandas_gbq.to_gbq(purchase_size,destination_table = 'destination_table', project_id=project_write_table,if_exists='append')
+
+    apps_visit['event_date'] = apps_visit['event_date'].astype('str').apply(lambda x: str(x)).map(lambda x: x.replace("-", "")).astype('int')
+    last_3_day = apps_visit[apps_visit['event_date']>=int(last3days.strftime('%Y%m%d'))].groupby('user_id')['event_name'].count().reset_index()
+    last_7_day = apps_visit[apps_visit['event_date']>=int(last7days.strftime('%Y%m%d'))].groupby('user_id')['event_name'].count().reset_index()
+    last_month = apps_visit[apps_visit['event_date']>=int(prev1month.strftime('%Y%m%d'))].groupby('user_id')['event_name'].count().reset_index()
+    last_3month = apps_visit[apps_visit['event_date']>=int(prev3month.strftime('%Y%m%d'))].groupby('user_id')['event_name'].count().reset_index()
+    last_3_day.rename(columns={"event_name": "visit_last3days"},inplace=True)
+    last_7_day.rename(columns={"event_name": "visit_last7days"},inplace=True)
+    last_month.rename(columns={"event_name": "visit_lastmonth"},inplace=True)
+    last_3month.rename(columns={"event_name": "visit_last3month"},inplace=True)
+    visit_summary = pd.merge(apps_visit[['user_id']].drop_duplicates(),last_3_day,on='user_id',how='left')
+    visit_summary = pd.merge(visit_summary,last_7_day,on='user_id',how='left')
+    visit_summary = pd.merge(visit_summary,last_month,on='user_id',how='left')
+    visit_summary = pd.merge(visit_summary,last_3month,on='user_id',how='left')
+    visit_summary.rename(columns={"user_id": "store_id"},inplace=True)
+    visit_summary.loc[visit_summary['visit_last3days'].isna(),'visit_last3days']=0
+    visit_summary.loc[visit_summary['visit_last7days'].isna(),'visit_last7days']=0
+    visit_summary.loc[visit_summary['visit_lastmonth'].isna(),'visit_lastmonth']=0
+    visit_summary.loc[visit_summary['visit_last3month'].isna(),'visit_last3month']=0
+    visit_summary['date']=now
+    pandas_gbq.to_gbq(visit_summary,destination_table = 'destination_table', project_id=project_write_table,if_exists='append')
+    
+    query_cycle = '''select * from `destination_table` where date >= '''+'"'+str(prev6month.strftime("%Y-%m-%d"))+'"'
+    purchase_cycle = bqclient.query(query_cycle).result().to_dataframe(create_bqstorage_client=True)
+    purchase_cycle['nodes']=np.where((purchase_cycle['status']=='Churned'), purchase_cycle['status'], purchase_cycle['cycle'])
+    purchase_cycle.loc[(purchase_cycle['nodes']=='Churned'),'cycle_rank']=0
+    purchase_cycle.loc[(purchase_cycle['nodes']=='no purchase'),'cycle_rank']=1
+    purchase_cycle.loc[(purchase_cycle['nodes']=='no cycle'),'cycle_rank']=2
+    purchase_cycle.loc[(purchase_cycle['nodes']=='monthly'),'cycle_rank']=3
+    purchase_cycle.loc[(purchase_cycle['nodes']=='biweekly'),'cycle_rank']=4
+    purchase_cycle.loc[(purchase_cycle['nodes']=='weekly'),'cycle_rank']=5
+    purchase_cycle.loc[(purchase_cycle['nodes']=='semiweekly'),'cycle_rank']=6
+    data=purchase_cycle
+    cycle_summary = pd.DataFrame()
+    index=pd.DataFrame(purchase_cycle['date'].drop_duplicates().reset_index().sort_values(by=['date'],ascending=False)['date'])
+    list_index=[1,2,3,4,5,6]
+    list_store = list(data['store_id'].unique())
+    for j in list_store:
+      store = data[data['store_id']==j].reset_index(drop=True)
+      store = pd.merge(index,store[['date','cycle_rank']],on='date',how='left').sort_values(by=['date'])
+      store.loc[store['cycle_rank'].isna(),'cycle_rank']=-1
+      trend = trenddetector(list_index,list(store['cycle_rank']))
+      mode = statistics.mode(store['cycle_rank'])
+      mean = statistics.mean(store['cycle_rank'])
+      temp = pd.DataFrame({'store_id':[j], 'trend_cycle':[trend],'mode_cycle':[mode],'mean_cycle':[mean]})
+      cycle_summary=pd.concat([cycle_summary,temp],ignore_index=True)
+    cycle_summary['date']=now
+    cycle_summary=pd.merge(all_store[['company_id','store_id']],cycle_summary,on='store_id',how='inner')
+    pandas_gbq.to_gbq(cycle_summary,destination_table = 'model_table.cycle_summary', project_id=project_write_table,if_exists='append')
+
+    cycle_update = purchase_cycle[purchase_cycle['date']==now][['store_id','cycle_rank']]
+    data = pd.merge(cycle_summary,purchase_size[['store_id','average_gmv','min_gmv','max_gmv','average_transaction','count_transaction']],on='store_id',how='left')
+    data = pd.merge(data,visit_summary[['store_id','visit_last3days','visit_last7days','visit_lastmonth','visit_last3month']],on='store_id',how='left')
+    data = pd.merge(data,cycle_update,on='store_id',how='left')
+    data.loc[data['average_gmv'].isna(),'average_gmv']=0
+    data.loc[data['min_gmv'].isna(),'min_gmv']=0
+    data.loc[data['max_gmv'].isna(),'max_gmv']=0
+    data.loc[data['average_transaction'].isna(),'average_transaction']=0
+    data.loc[data['count_transaction'].isna(),'count_transaction']=0
+    data.loc[data['visit_last3days'].isna(),'visit_last3days']=0
+    data.loc[data['visit_last7days'].isna(),'visit_last7days']=0
+    data.loc[data['visit_lastmonth'].isna(),'visit_lastmonth']=0
+    data.loc[data['visit_last3month'].isna(),'visit_last3month']=0
+
+    data.loc[(data['cycle_rank']>=4),'new_cycle_rank_type'] = 7
+    data.loc[(data['cycle_rank']==3),'new_cycle_rank_type'] = 6
+    data.loc[(data['cycle_rank']==2) & (data['mean_cycle']<=0.01),'new_cycle_rank_type'] = 5
+    data.loc[(data['cycle_rank']==2) & (data['mean_cycle']>0.01) & (data['trend_cycle']>=0.7),'new_cycle_rank_type'] = 5
+    data.loc[(data['cycle_rank']==2) & (data['mean_cycle']>0.01) & (data['trend_cycle']>=0.07) & (data['trend_cycle']<0.7),'new_cycle_rank_type'] = 5
+    data.loc[(data['cycle_rank']==2) & (data['mean_cycle']>0.01) & (data['trend_cycle']<0.07),'new_cycle_rank_type'] = 4
+    data.loc[(data['cycle_rank']==1),'new_cycle_rank_type'] = 3
+    data.loc[(data['cycle_rank']==0) & (data['mean_cycle']!=0) & (data['trend_cycle']>=-0.2),'new_cycle_rank_type'] = 2
+    data.loc[(data['cycle_rank']==0) & (data['mean_cycle']!=0) & (data['trend_cycle']>=-0.4) & (data['trend_cycle']<-0.2),'new_cycle_rank_type'] = 2
+    data.loc[(data['cycle_rank']==0) & (data['mean_cycle']!=0) & (data['trend_cycle']>=-0.6) & (data['trend_cycle']<-0.4),'new_cycle_rank_type'] = 2
+    data.loc[(data['cycle_rank']==0) & (data['mean_cycle']!=0) & (data['trend_cycle']<-0.6),'new_cycle_rank_type'] = 2
+    data.loc[(data['cycle_rank']==0) & (data['mean_cycle']==0),'new_cycle_rank_type'] = 1
+    data['new_cycle_rank_type']=data['new_cycle_rank_type'].astype('int')
+    data.loc[(data['average_gmv']>=6724262),'new_monetary_rank_type'] = 4
+    data.loc[(data['average_gmv']<6724262) & (data['average_gmv']>=4951908),'new_monetary_rank_type'] = 4
+    data.loc[(data['average_gmv']<4951908) & (data['average_gmv']>=2226512),'new_monetary_rank_type'] = 4
+    data.loc[(data['average_gmv']<2226512) & (data['average_gmv']>=1025478),'new_monetary_rank_type'] = 4
+    data.loc[(data['average_gmv']<1025478) & (data['average_gmv']>=366573),'new_monetary_rank_type'] = 3
+    data.loc[(data['average_gmv']<366573) & (data['average_gmv']>=26519),'new_monetary_rank_type'] = 2
+    data.loc[(data['average_gmv']<26519) ,'new_monetary_rank_type'] = 1
+    data['new_monetary_rank_type']=data['new_monetary_rank_type'].astype('int')
+    data.loc[(data['visit_lastmonth']>30),'new_visit_rank_type'] = 4
+    data.loc[(data['visit_lastmonth']<=30) & (data['visit_lastmonth']>=3),'new_visit_rank_type'] = 3
+    data.loc[(data['visit_lastmonth']<3) & (data['visit_lastmonth']>=1),'new_visit_rank_type'] = 2
+    data.loc[(data['visit_lastmonth']==0) ,'new_visit_rank_type'] = 1
+    data['new_visit_rank_type']=data['new_visit_rank_type'].astype('int')
+    data.loc[(data['new_cycle_rank_type']>=6) & (data['new_monetary_rank_type']>=2) & (data['new_visit_rank_type']>=2),'grade'] = 13
+    data.loc[(data['new_cycle_rank_type']>=6) & (data['new_monetary_rank_type']>=2) & (data['new_visit_rank_type']==1),'grade'] = 12
+    data.loc[(data['new_cycle_rank_type']>=6) & (data['new_monetary_rank_type']==1) & (data['new_visit_rank_type']>=2),'grade'] = 11
+    data.loc[(data['new_cycle_rank_type']>=6) & (data['new_monetary_rank_type']==1) & (data['new_visit_rank_type']==1),'grade'] = 10
+    data.loc[(data['new_cycle_rank_type']>=4) & (data['new_cycle_rank_type']<=5) & (data['new_monetary_rank_type']>=2) & (data['new_visit_rank_type']>=2),'grade'] = 9
+    data.loc[(data['new_cycle_rank_type']>=4) & (data['new_cycle_rank_type']<=5) & (data['new_monetary_rank_type']>=2) & (data['new_visit_rank_type']==1),'grade'] = 8
+    data.loc[(data['new_cycle_rank_type']>=4) & (data['new_cycle_rank_type']<=5) & (data['new_monetary_rank_type']==1) & (data['new_visit_rank_type']>=2),'grade'] = 7
+    data.loc[(data['new_cycle_rank_type']==5) & (data['new_monetary_rank_type']==1) & (data['new_visit_rank_type']==1),'grade'] = 6
+    data.loc[(data['new_cycle_rank_type']==4) & (data['new_monetary_rank_type']==1) & (data['new_visit_rank_type']==1),'grade'] = 5
+    data.loc[(data['new_cycle_rank_type']>=1) & (data['new_cycle_rank_type']<=3) & (data['new_monetary_rank_type']>=1) & (data['new_visit_rank_type']>=2),'grade'] = 4
+    data.loc[(data['new_cycle_rank_type']==3) & (data['new_monetary_rank_type']==1) & (data['new_visit_rank_type']==1),'grade'] = 3
+    data.loc[(data['new_cycle_rank_type']==2) & (data['new_monetary_rank_type']==1) & (data['new_visit_rank_type']==1),'grade'] = 2
+    data.loc[(data['new_cycle_rank_type']==1) & (data['new_monetary_rank_type']==1) & (data['new_visit_rank_type']==1),'grade'] = 1
+    data['date']=now
+    data_final=data[['company_id','store_id','new_cycle_rank_type','new_monetary_rank_type','new_visit_rank_type','grade','date']]
+    pandas_gbq.to_gbq(data_final,destination_table = 'destination_table', project_id=project_write_table,if_exists='append')  In [7]:  PIPELINE_NAME = "store-grading-pipeline-prod-v2"
+@kfp.dsl.pipeline(name=PIPELINE_NAME)
+def pipeline(
+    
+):
+    data_op = process()  In [8]:  TEMPLATE_PATH = "store-grading-pipeline-production-v2.json"
+
+compiler.Compiler().compile(
+    pipeline_func=pipeline,
+    package_path=TEMPLATE_PATH,
+)  PIPELINE_ROOT  # PIPELINE_ROOT = f"gs://{GCS_BUCKET}/{GCS_PIPELINE_ROOT_DIRECTORY}"
+# job = aip.PipelineJob(
+#     project=PROJECT_ID,
+#     location=REGION,
+#     display_name=PIPELINE_NAME,
+#     template_path=TEMPLATE_PATH,
+#     pipeline_root=PIPELINE_ROOT,
+#     enable_caching=False
+# )
+# job.run(service_account=SERVICE_ACCOUNT)
