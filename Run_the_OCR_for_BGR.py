@@ -1,6 +1,6 @@
-# pip  install tesseract-ocr
-# pip install pytesseract
-# pip install opencv-python-headless
+pip  install tesseract-ocr
+pip install pytesseract
+pip install opencv-python-headless
 pip install easyocr
 
 
